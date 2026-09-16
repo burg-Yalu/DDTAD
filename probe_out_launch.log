@@ -1,0 +1,27 @@
+==========================================================================================
+程序       : ddtad_probe.py
+数据根     : /mnt/sdb/home/liuqr/Dataset/data/data
+设备       : NVIDIA GeForce RTX 4090 (25.3 GB, SM89) 可见卡数=5
+通道数     : 7   进程数: 4   可见卡数: 5
+透传参数   : --iters_list 6000 --col_policies drop,zero --t_starts 50,100,200,300,400 --scores paper,zval_max,zself_max --n_sample 2  
+------------------------------------------------------------------------------------------
+  shard0 (GPU0,  1 通道, 负载    8516 点): E-1
+  shard1 (GPU1,  2 通道, 负载   10726 点): D-1,T-4
+  shard2 (GPU2,  2 通道, 负载   10769 点): C-1,P-1
+  shard3 (GPU3,  2 通道, 负载   10195 点): D-12,M-1
+==========================================================================================
+[启动] shard0 -> GPU0  日志: /mnt/sdb/home/liuqr/Project/20269/ddtad/probe_out/shard0.log
+[启动] shard1 -> GPU1  日志: /mnt/sdb/home/liuqr/Project/20269/ddtad/probe_out/shard1.log
+[启动] shard2 -> GPU2  日志: /mnt/sdb/home/liuqr/Project/20269/ddtad/probe_out/shard2.log
+[启动] shard3 -> GPU3  日志: /mnt/sdb/home/liuqr/Project/20269/ddtad/probe_out/shard3.log
+
+全部启动，等待完成（可另开终端 tail -f /mnt/sdb/home/liuqr/Project/20269/ddtad/probe_out/shard0.log 看进度）...
+
+[完成] shard0 (GPU0) OK   用时 400s 累计
+[完成] shard3 (GPU3) OK   用时 671s 累计
+[完成] shard2 (GPU2) OK   用时 691s 累计
+[完成] shard1 (GPU1) OK   用时 701s 累计
+
+==========================================================================================
+已合并 4 个分片报告 -> /mnt/sdb/home/liuqr/Project/20269/ddtad/probe_out/probe_report_all.txt
+总耗时 701s

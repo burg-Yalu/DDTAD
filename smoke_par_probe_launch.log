@@ -1,0 +1,27 @@
+==========================================================================================
+程序       : ddtad_probe.py
+数据根     : /mnt/sdb/home/liuqr/Dataset/data/data
+设备       : NVIDIA GeForce RTX 4090 (25.3 GB, SM89) 可见卡数=5
+通道数     : 4   进程数: 4   可见卡数: 5
+透传参数   : --iters_list 50 --col_policies drop --t_starts 100 --scores paper --n_sample 1 --test_ss 128  
+------------------------------------------------------------------------------------------
+  shard0 (GPU0,  1 通道, 负载    8516 点): E-1
+  shard1 (GPU1,  1 通道, 负载    8509 点): D-1
+  shard2 (GPU2,  1 通道, 负载    8505 点): P-1
+  shard3 (GPU3,  1 通道, 负载    2217 点): T-4
+==========================================================================================
+[启动] shard0 -> GPU0  日志: /mnt/sdb/home/liuqr/Project/20269/ddtad/smoke_par_probe/shard0.log
+[启动] shard1 -> GPU1  日志: /mnt/sdb/home/liuqr/Project/20269/ddtad/smoke_par_probe/shard1.log
+[启动] shard2 -> GPU2  日志: /mnt/sdb/home/liuqr/Project/20269/ddtad/smoke_par_probe/shard2.log
+[启动] shard3 -> GPU3  日志: /mnt/sdb/home/liuqr/Project/20269/ddtad/smoke_par_probe/shard3.log
+
+全部启动，等待完成（可另开终端 tail -f /mnt/sdb/home/liuqr/Project/20269/ddtad/smoke_par_probe/shard0.log 看进度）...
+
+[完成] shard0 (GPU0) OK   用时 10s 累计
+[完成] shard1 (GPU1) OK   用时 10s 累计
+[完成] shard2 (GPU2) OK   用时 10s 累计
+[完成] shard3 (GPU3) OK   用时 10s 累计
+
+==========================================================================================
+已合并 4 个分片报告 -> /mnt/sdb/home/liuqr/Project/20269/ddtad/smoke_par_probe/probe_report_all.txt
+总耗时 10s

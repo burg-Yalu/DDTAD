@@ -1,0 +1,40 @@
+==========================================================================================
+程序       : ddtad_run.py
+数据根     : /mnt/sdb/home/liuqr/Dataset/data/data
+设备       : NVIDIA GeForce RTX 4090 (25.3 GB, SM89) 可见卡数=5
+通道数     : 4   进程数: 4   可见卡数: 5
+透传参数   : --iters 50 --col_policy drop --t_start 100 --score paper --thresh val --n_sample 1 --test_ss 128  
+------------------------------------------------------------------------------------------
+  shard0 (GPU0,  1 通道, 负载    8516 点): E-1
+  shard1 (GPU1,  1 通道, 负载    8509 点): D-1
+  shard2 (GPU2,  1 通道, 负载    8505 点): P-1
+  shard3 (GPU3,  1 通道, 负载    2217 点): T-4
+==========================================================================================
+[启动] shard0 -> GPU0  日志: /mnt/sdb/home/liuqr/Project/20269/ddtad/smoke_par_run/shard0.log
+[启动] shard1 -> GPU1  日志: /mnt/sdb/home/liuqr/Project/20269/ddtad/smoke_par_run/shard1.log
+[启动] shard2 -> GPU2  日志: /mnt/sdb/home/liuqr/Project/20269/ddtad/smoke_par_run/shard2.log
+[启动] shard3 -> GPU3  日志: /mnt/sdb/home/liuqr/Project/20269/ddtad/smoke_par_run/shard3.log
+
+全部启动，等待完成（可另开终端 tail -f /mnt/sdb/home/liuqr/Project/20269/ddtad/smoke_par_run/shard0.log 看进度）...
+
+[完成] shard0 (GPU0) OK   用时 10s 累计
+[完成] shard1 (GPU1) OK   用时 10s 累计
+[完成] shard2 (GPU2) OK   用时 10s 累计
+[完成] shard3 (GPU3) OK   用时 10s 累计
+
+==========================================================================================
+
+==========================================================================================
+DDTAD 多卡汇总（4 进程 / 4 通道）
+汇总：参与评估通道 4 个
+  点级   plain  P=13.37  R=1.59  F1=2.84   [宏观 F1=2.75]
+  点级   PA     P=90.59  R=99.32  F1=94.76   [宏观 F1=84.90]
+  窗口级 plain  F1=0.00   窗口级 PA  F1=0.00
+  oracle 上界（阈值扫描，仅诊断）宏观点级 F1=19.13
+  论文 DDTAD 参考：SMAP P=92.27 R=91.30 F1=91.78 | MSL P=94.47 R=97.21 F1=95.82（点级+PA）
+  [MSL] 通道=  1  plain F1=  2.88  PA P= 50.36 R=100.00 F1= 66.99
+  [SMAP] 通道=  3  plain F1=  2.84  PA P= 91.72 R= 99.31 F1= 95.37
+==========================================================================================
+
+结果已保存: /mnt/sdb/home/liuqr/Project/20269/ddtad/smoke_par_run/report.txt | results.json | summary.csv
+总耗时 10s

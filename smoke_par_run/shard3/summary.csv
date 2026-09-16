@@ -1,0 +1,2 @@
+channel,spacecraft,class,n_var,n_live,n_points,n_anom_points,P_plain,R_plain,F1_plain,P_pa,R_pa,F1_pa,F1_win_pa,oracleF1,thresh,pred_pos_rate,normal_mean,anom_mean,gap_ratio
+T-4,MSL,[point],14,11,2217,69,0.0286,0.0290,0.0288,0.5036,1.0000,0.6699,0.0000,0.0753,0.05756,0.0316,0.03108,0.03179,1.0227
