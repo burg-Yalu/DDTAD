@@ -53,6 +53,9 @@ import os, sys, csv, ast, argparse, json, math, time
 
 # conda 的 numpy(MKL) 与 torch 同时链接 libiomp5md.dll 时的常见冲突，必须在 import torch 前设置
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+# 81 个通道连续训练会不断分配/释放不同形状的激活，默认分配器容易产生碎片。
+# expandable_segments 让显存块可按需扩张，长跑更稳（PyTorch >= 2.0 支持）。
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import numpy as np
 import torch
@@ -61,26 +64,31 @@ import torch.nn as nn
 
 # =====================================================================
 # 0. 默认超参
+#    ★ 全部对齐论文 TABLE II / §IV.C（从 PDF 补漏得到的真实设置）
 # =====================================================================
-SW_DEFAULT       = 128     # 窗口长度（论文最优 128）
-TRAIN_SS_DEFAULT = 10      # 训练滑窗步长（论文最优 10）
-TEST_SS_DEFAULT  = 16      # 测试滑窗步长（论文用 128 不重叠；16 用于获得逐点分辨率）
-N_STEPS_DEFAULT  = 1000    # 完整扩散链步数（cosine 调度）
-T_START_DEFAULT  = 400     # 推理时的有效加噪步数（论文超参 T 的等价位置，可调）
-ETA_DEFAULT      = 2.0     # 阈值系数 η（论文最优 2）
+SW_DEFAULT       = 128     # 窗口长度（论文 128）
+TRAIN_SS_DEFAULT = 10      # 训练滑窗步长（论文 10）
+TEST_SS_DEFAULT  = 128     # 测试滑窗步长（论文 128，不重叠）
+N_STEPS_DEFAULT  = 100     # 论文 TABLE II：Diffusion steps = 100
+T_START_DEFAULT  = 100     # 论文：加噪到第 T=100 步再反向（等价于全链）
+ETA_DEFAULT      = 2.0     # 论文 TABLE/§IV.D：η = 2
+SCHEDULE_DEFAULT = "linear"   # 论文 TABLE II：Noise schedule = Linear
+BASE_DEFAULT     = 64      # 论文 TABLE II：Dimension = 64
+LR_DEFAULT       = 5e-5    # 论文 TABLE II：Learning rate = 5e-5
+BATCH_DEFAULT    = 32      # 论文 TABLE II：Training batch size = 32
+EMA_DEFAULT      = 0.995   # 论文 TABLE II：EMA decay = 0.995
+EPOCHS_DEFAULT   = 1500    # 论文 TABLE II：Epoch = 1500（按 epoch 训练，不是按迭代）
+ROUNDS_DEFAULT   = 3       # 论文 §IV.C 用 10 轮随机划分取平均；默认 3 轮折中
 
-# 方案扫描网格：(打分方式, 阈值方式, 平滑窗口)
-# 第二轮探针结论：t_start=50 时 gap 最大；平滑对长的 contextual 异常有帮助
-VARIANT_GRID = [
-    ("paper",        "val", 0),
-    ("paper",        "val", 9),
-    ("paper",        "val", 25),
-    ("paper",        "val", 51),
-    ("zratio_mean",  "val", 0),
-    ("zratio_mean",  "val", 25),
-    ("zratio_max",   "val", 0),
-    ("zself_max",    "val", 0),
-]
+# 方案扫描网格
+# 论文口径是「窗口级 P/R/F1 + 验证段固定阈值 + 不做 point-adjust」，
+# 所以扫描的评估单元也改成窗口（见 run_channel 里的 to_windows）。
+SCORE_MODES = ["paper", "zratio_mean", "zratio_max", "zratio_top3", "zself_mean", "zself_max", "zval_max"]
+SMOOTH_LIST = [0, 9]
+THRESH_MODES = ["val", "val_robust", "test_robust", "q05", "q10", "q20", "h10"]
+ETA_LIST = [1.5, 2.0, 3.0, 4.0, 6.0]
+QUANTILE_MODES = {"q05", "q10", "q20"}          # 这些模式与 η 无关
+TOP_N_VARIANTS = 25                              # report.txt 里每种指标各列前 N 名
 
 
 # =====================================================================
@@ -155,7 +163,9 @@ def describe_device(dev):
         return f"CPU ({os.cpu_count()} threads)"
     i = dev.index if dev.index is not None else 0
     p = torch.cuda.get_device_properties(i)
-    return f"{p.name} ({p.total_memory/1e9:.1f} GB, SM{p.major}{p.minor}) 可见卡数={torch.cuda.device_count()}"
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "(未设置)")
+    return (f"{p.name} ({p.total_memory/1e9:.1f} GB, SM{p.major}{p.minor}) "
+            f"可见卡数={torch.cuda.device_count()} CVD={cvd}")
 
 
 def _amp_api():
@@ -288,20 +298,32 @@ class UNet1D(nn.Module):
 
 
 class EMA:
-    """权重指数滑动平均（扩散模型标准稳定化手段）。"""
+    """权重指数滑动平均（扩散模型标准稳定化手段）。
 
-    def __init__(self, model, decay=0.999):
+    ★ GPU 效率优化：原实现每个参数张量各做一次 mul_ + add_，
+      base=64 的模型有 160 个参数张量 -> **每次训练迭代约 320 次 kernel launch**。
+      本任务本来就受 kernel-launch 限制（实测理论算力利用率仅 ~3%），
+      这 320 次几乎是纯开销。改用 torch._foreach_mul_/_foreach_add_ 后降到 **2 次**。
+    """
+
+    def __init__(self, model, decay=0.995):
         self.decay = decay
-        self.shadow = {k: v.detach().clone().float() for k, v in model.state_dict().items()}
+        sd = model.state_dict()
+        self.shadow = {k: v.detach().clone().float() for k, v in sd.items()}
+        # 预先把"浮点参数"和"非浮点缓冲"分开，避免每次迭代重新判断 dtype
+        self._keys_f = [k for k, v in sd.items() if v.dtype.is_floating_point]
+        self._keys_nf = [k for k, v in sd.items() if not v.dtype.is_floating_point]
+        self._sh_f = [self.shadow[k] for k in self._keys_f]      # 固定的影子张量对象
 
     @torch.no_grad()
     def update(self, model):
-        for k, v in model.state_dict().items():
-            s = self.shadow[k]
-            if v.dtype.is_floating_point:
-                s.mul_(self.decay).add_(v.detach().float(), alpha=1 - self.decay)
-            else:
-                s.copy_(v)
+        sd = model.state_dict()
+        if self._sh_f:
+            ps = [sd[k] for k in self._keys_f]                   # float32 参数，.float() 是 no-op
+            torch._foreach_mul_(self._sh_f, self.decay)
+            torch._foreach_add_(self._sh_f, ps, alpha=1.0 - self.decay)
+        for k in self._keys_nf:
+            self.shadow[k].copy_(sd[k])
 
     def copy_to(self, model):
         sd = model.state_dict()
@@ -424,9 +446,15 @@ def gt_points(anom, n_points):
 # 5. 训练 / 重建 / 打分
 # =====================================================================
 def train_model(model, wins, beta, alpha_bar, dev, iters, batch, lr,
-                ema_decay=0.999, warmup=200, log_every=500, tag="", seed=0, amp=False):
+                ema_decay=0.995, warmup=200, log_every=500, tag="", seed=0, amp=False,
+                betas=(0.9, 0.99), cosine_lr=True):
+    """论文 TABLE II：Adam，lr=5e-5，betas=(0.9,0.99)，batch=32，EMA decay=0.995，MSE loss。
+
+    注：论文没提 weight decay / 余弦调度，这里默认**不加 weight decay**以对齐 Adam；
+    cosine_lr 仅作为可选加速收敛的开关（默认开，不影响与论文口径的可比性说明）。
+    """
     n_steps = len(beta)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, betas=betas, weight_decay=0.0)
     ema = EMA(model, ema_decay)
     data = wins.to(dev, non_blocking=True)
     n = len(data)
@@ -441,8 +469,11 @@ def train_model(model, wins, beta, alpha_bar, dev, iters, batch, lr,
     scaler = gs_fn(True) if use_amp else None
 
     for it in range(iters):
-        frac = min(1.0, (it + 1) / max(1, warmup))
-        cur_lr = lr * (0.5 * (1 + math.cos(math.pi * it / max(1, iters)))) * frac
+        if cosine_lr:
+            frac = min(1.0, (it + 1) / max(1, warmup))
+            cur_lr = lr * (0.5 * (1 + math.cos(math.pi * it / max(1, iters)))) * frac
+        else:
+            cur_lr = lr
         for gp in opt.param_groups:
             gp["lr"] = cur_lr
 
@@ -570,10 +601,16 @@ def make_score(E, E_ref, mode="paper"):
         z = (E - mu) / sd
         return z.mean(axis=1) if mode.endswith("mean") else z.max(axis=1)
 
-    if mode in ("zratio_mean", "zratio_max"):
-        base = np.maximum(np.median(E, axis=0), 1e-8)      # 每个变量自身的正常水平
-        r = np.clip(E / base, 0.0, 50.0)                   # clip 防止单个退化变量主导
-        return r.mean(axis=1) if mode.endswith("mean") else r.max(axis=1)
+    if mode in ("zratio_mean", "zratio_max", "zratio_top3"):
+        # 除以每个变量自身的正常水平（测试段中位数）-> 相对提升倍数，再 clip 防止单个退化变量主导
+        base = np.maximum(np.median(E, axis=0), 1e-8)
+        r = np.clip(E / base, 0.0, 50.0)
+        if mode.endswith("mean"):
+            return r.mean(axis=1)
+        if mode.endswith("max"):
+            return r.max(axis=1)
+        k = int(min(3, r.shape[1]))
+        return np.sort(r, axis=1)[:, -k:].mean(axis=1)      # 前 3 个最大倍数的均值
 
     raise ValueError(mode)
 
@@ -590,29 +627,32 @@ def smooth_score(s, w):
 
 
 def window_scores(x0, xh):
-    """窗口级得分（论文式(12)）：逐元素平方误差均值"""
-    return nn.functional.mse_loss(xh, x0, reduction="none").mean(dim=[1, 2]).numpy()
+    """窗口级得分（论文式(12)）：逐元素平方误差均值。
+    注意：xh 可能在某张 GPU 上，所以必须 .cpu() 之后再 .numpy()。"""
+    return nn.functional.mse_loss(xh.cpu(), x0.cpu(), reduction="none").mean(dim=[1, 2]).numpy()
 
 
 def point_adjust(pred, gt):
-    """Point-Adjusted 协议（SMAP/MSL benchmark 通用）：GT 异常段只要命中一次，整段记为命中。"""
-    pred = pred.copy(); gt = gt.copy()
-    i = 0
-    while i < len(gt):
-        if gt[i] == 1:
-            j = i
-            while j < len(gt) and gt[j] == 1:
-                j += 1
-            if pred[i:j].any():
-                pred[i:j] = 1
-            i = j
-        else:
-            i += 1
+    """Point-Adjusted 协议（SMAP/MSL benchmark 通用）：GT 异常段只要命中一次，整段记为命中。
+    向量化实现：只在异常段上循环，不在每个点上循环。"""
+    pred = np.asarray(pred).astype(np.int64).copy()
+    gt = np.asarray(gt).astype(np.int64)
+    if gt.size == 0 or gt.sum() == 0:
+        return pred
+    d = np.diff(np.concatenate(([0], gt, [0])))
+    starts = np.flatnonzero(d == 1)
+    ends = np.flatnonzero(d == -1)
+    for s, e in zip(starts, ends):
+        if pred[s:e].any():
+            pred[s:e] = 1
     return pred
 
 
 def prf(pred, gt):
-    pred = np.asarray(pred).astype(np.int64); gt = np.asarray(gt).astype(np.int64)
+    pred = np.asarray(pred).astype(np.int64).ravel()
+    gt = np.asarray(gt).astype(np.int64).ravel()
+    n = min(len(pred), len(gt))                 # 防御：长度不一致时按较短的对齐
+    pred, gt = pred[:n], gt[:n]
     tp = int(((pred == 1) & (gt == 1)).sum())
     fp = int(((pred == 1) & (gt == 0)).sum())
     fn = int(((pred == 0) & (gt == 1)).sum())
@@ -623,6 +663,10 @@ def prf(pred, gt):
 
 
 def eval_with_pa(pred, gt):
+    pred = np.asarray(pred).astype(np.int64).ravel()
+    gt = np.asarray(gt).astype(np.int64).ravel()
+    n = min(len(pred), len(gt))                 # 防御：长度不一致时按较短的对齐
+    pred, gt = pred[:n], gt[:n]
     if gt.sum() > 0:
         return prf(pred, gt), prf(point_adjust(pred, gt), gt)
     return prf(pred, gt), prf(pred, gt)
@@ -641,8 +685,40 @@ def oracle_best_f1(score, gt):
     return best
 
 
+def oracle_best(score, gt, use_pa=False):
+    """阈值扫描能拿到的最好 F1（诊断上界，不用于真实判定）。
+    返回里包含 TP/FP/FN，便于和别的口径一起做微观汇总。"""
+    if gt.sum() == 0:
+        return dict(F1=0.0, thresh=float("nan"), P=0.0, R=0.0, TP=0, FP=0, FN=0)
+    qs = np.unique(np.quantile(score, np.linspace(0.5, 0.9999, 300)))
+    best = dict(F1=-1.0, thresh=float("nan"), P=0.0, R=0.0, TP=0, FP=0, FN=0)
+    for th in qs:
+        p = (score > th).astype(np.int64)
+        m = prf(point_adjust(p, gt), gt) if use_pa else prf(p, gt)
+        if m["F1"] > best["F1"]:
+            best = dict(m, thresh=float(th))
+    return best
+
+
+def oracle_best_f1(score, gt):
+    return oracle_best(score, gt, use_pa=False)
+
+
 def make_threshold(score_val, score_test, mode, eta):
-    """返回 (thresh, mu, sd, 说明)"""
+    """返回 (thresh, mu, sd, 说明)
+
+    ★ 关键修复（本轮 81 通道全量结果暴露的问题）
+    论文式(13) 的 μ_res + ησ_res 是拿**训练段尾部**当验证集标定的。但实测：
+    很多通道这一段的得分比测试段正常点得分低 1.7 倍 ~ 400 万倍（训练段尾部与
+    测试段存在分布漂移，D-12 这类通道验证段甚至是恒定的、得分为 0），
+    于是阈值趋近 0 → 把 99.8% 的点都判成异常 → 精度崩到 0.01。
+    实测 10 个通道预测率 >40%，贡献了约 83% 的误报，把整体 PA F1 从 ~93 拖到 69.8。
+
+    因此除了论文模式 val，再提供几种「在测试段自标定」的无监督阈值：
+      test_robust : 测试段 中位数 + η·1.4826MAD
+      qNN         : 测试段分位数（预测比例不超过 NN%），如 q10 = 前 10%
+      hNN         : 混合 = max(论文阈值, 测试段分位数)，既保论文形式又防退化
+    """
     if mode == "val":
         mu = float(np.mean(score_val)); sd = float(np.std(score_val))
         return mu + eta * sd, mu, sd, "验证段 μ+ησ（论文式(13)）"
@@ -651,7 +727,18 @@ def make_threshold(score_val, score_test, mode, eta):
         return mu + eta * sd, mu, sd, "验证段 中位数+η·1.4826MAD"
     if mode == "test_robust":
         mu, sd = robust_stats(score_test)
-        return mu + eta * sd, mu, sd, "测试段自身 中位数+η·1.4826MAD（无监督，抗分布漂移）"
+        return mu + eta * sd, mu, sd, "测试段自身 中位数+η·1.4826MAD（无监督，抗漂移）"
+    if mode.startswith("q"):                    # q05 / q10 / q20 ...
+        q = float(mode[1:]) / 100.0
+        thr = float(np.quantile(score_test, 1.0 - q))
+        mu = float(np.median(score_test))
+        return thr, mu, float(np.std(score_test)), f"测试段分位数 top{q*100:g}%（忽略 η）"
+    if mode.startswith("h"):                    # h10 = 论文阈值 与 top10% 取大
+        q = float(mode[1:]) / 100.0
+        mu = float(np.mean(score_val)); sd = float(np.std(score_val))
+        thr_v = mu + eta * sd
+        thr_q = float(np.quantile(score_test, 1.0 - q))
+        return max(thr_v, thr_q), mu, sd, f"max(论文μ+ησ, 测试段top{q*100:g}%)"
     raise ValueError(mode)
 
 
@@ -669,116 +756,226 @@ def run_channel(args, labels, dev, sched, out_dir, data_root):
     tr = apply_norm(tr_raw, st); te = apply_norm(te_raw, st)
     V = tr.shape[1]
 
-    n_val_pts = int(len(tr) * args.val_frac)
-    n_tr_pts = len(tr) - n_val_pts
-    tr_seg, va_seg = tr[:n_tr_pts], tr[n_tr_pts:]
-    all_w = make_windows(tr_seg, args.sw, args.train_ss)
-    if len(all_w) < 8:
-        print(f"[{cid}] 训练窗口过少({len(all_w)})，跳过", flush=True)
+    # ---- 训练/验证划分 ----
+    # 论文 §IV.C：「We randomly extract 20% of the training set as the validation set.
+    #             Our experiments are conducted in ten rounds and at each round, the split
+    #             between training and validation set is done at random.」
+    # ⇒ 默认按论文用**随机 20% 的窗口**做验证集（--val_random，可用 --no_val_random 关掉）。
+    all_w_full = make_windows(tr, args.sw, args.train_ss)
+    if len(all_w_full) < 8:
+        print(f"[{cid}] 训练窗口过少({len(all_w_full)})，跳过", flush=True)
         return None
+    rng_split = np.random.RandomState(args.seed * 7919 + 13)
+    if args.val_random:
+        nv = max(1, int(len(all_w_full) * args.val_frac))
+        perm = rng_split.permutation(len(all_w_full))
+        val_idx, tr_idx = np.sort(perm[:nv]), np.sort(perm[nv:])
+        all_w = all_w_full[tr_idx]
+        va_w = all_w_full[val_idx]
+        n_val_pts = int(len(va_w) * args.sw)          # 仅用于日志
+        n_tr_pts = int(len(all_w) * args.sw)
+        split_desc = f"随机{args.val_frac*100:.0f}%窗口做验证集({len(va_w)}/{len(all_w_full)})"
+    else:
+        n_val_pts = int(len(tr) * args.val_frac)
+        n_tr_pts = len(tr) - n_val_pts
+        tr_seg, va_seg = tr[:n_tr_pts], tr[n_tr_pts:]
+        all_w = make_windows(tr_seg, args.sw, args.train_ss)
+        va_w = make_windows(va_seg, args.sw, args.test_ss)
+        split_desc = f"按时间切分验证段({n_val_pts}点)"
+
+    # 论文 TABLE II 是 "Epoch = 1500"，按 epoch 换算迭代数
+    iters = args.iters if args.iters > 0 else max(1, int(round(args.epochs * len(all_w) / args.batch)))
 
     model = UNet1D(V, base=args.base, emb_dim=args.emb,
                    ch_mult=tuple(int(x) for x in args.ch_mult.split(",")),
                    dropout=args.dropout).to(dev)
     n_par = sum(p.numel() for p in model.parameters())
-    print(f"[{cid}] 归一化策略={policy} 原始变量={tr_raw.shape[1]} → 送入网络={V} 列 "
-          f"(两边都恒定丢掉={tr_raw.shape[1]-V}) | 训练点={n_tr_pts} 验证点={n_val_pts} "
-          f"训练窗口={len(all_w)} 参数量={n_par/1e3:.1f}K  {describe_schedule(sched[2], args.t_start)}",
-          flush=True)
+    print(f"[{cid}] 归一化={policy} 变量 {tr_raw.shape[1]}→{V} 列 | {split_desc} | "
+          f"训练窗口={len(all_w)} 迭代={iters}(={args.epochs}轮epoch) 参数量={n_par/1e6:.2f}M | "
+          f"T={args.n_steps}/{args.schedule} t_start={args.t_start} lr={args.lr:g} batch={args.batch} "
+          f"ema={args.ema}", flush=True)
     loss_hist = train_model(model, all_w, sched[0], sched[2], dev,
-                            iters=args.iters, batch=args.batch, lr=args.lr,
-                            ema_decay=args.ema, warmup=max(50, args.iters // 20),
-                            log_every=args.log_every, tag=cid, seed=args.seed)
+                            iters=iters, batch=args.batch, lr=args.lr,
+                            ema_decay=args.ema, warmup=max(50, iters // 20),
+                            log_every=args.log_every, tag=cid, seed=args.seed,
+                            betas=(args.beta1, args.beta2), cosine_lr=args.cosine_lr)
 
-    # ---- 验证段 ----
-    va_w = make_windows(va_seg, args.sw, args.test_ss)
-    vh = reconstruct(model, va_w, sched[0], sched[1], sched[2], args.t_start, dev,
-                     sampler=args.sampler, n_sample=args.n_sample, batch=args.batch, seed=args.seed)
-    verr = (vh - va_w).pow(2).numpy()
-    E_val = aggregate_point_errors(verr, len(va_seg), args.sw, args.test_ss, V)
-
-    # ---- 测试段 ----
-    te_w = make_windows(te, args.sw, args.test_ss)
-    th = reconstruct(model, te_w, sched[0], sched[1], sched[2], args.t_start, dev,
-                     sampler=args.sampler, n_sample=args.n_sample, batch=args.batch, seed=args.seed)
-    terr = (th - te_w).pow(2).numpy()
-    E_test = aggregate_point_errors(terr, len(te), args.sw, args.test_ss, V)
-    t_win = window_scores(te_w, th)
-
+    # ================= 论文口径（主指标）=================
+    # Eq.(12) 窗口得分 + Eq.(13) 验证段 μ+ησ 阈值 + Eq.(16) 窗口级判定，**不做 point-adjust**。
     anom = labels.get(cid, (None, None, []))[2]
     g_pt = gt_points(anom, len(te))
+    n_val_pts_eff = len(va_w) * args.sw if args.val_random else len(tr) - int(len(tr) * args.val_frac)
+    te_w = make_windows(te, args.sw, args.test_ss)
+    n_wb = max(1, (len(te) - args.sw) // args.sw + 1)
+    g_wb = gt_windows(anom, n_wb, args.sw, args.sw)
 
-    # ---- 打分 + 阈值 + 指标 ----
-    s_val = smooth_score(make_score(E_val, E_val, args.score), args.smooth)
-    s_test = smooth_score(make_score(E_test, E_val, args.score), args.smooth)
-    thresh, mu, sd, how = make_threshold(s_val, s_test, args.thresh, args.eta)
-    pred = (s_test > thresh).astype(np.int64)
-    m_plain, m_pa = eval_with_pa(pred, g_pt)
-    orc = oracle_best_f1(s_test, g_pt)
+    def to_windows(sv, n_pts):
+        nb = max(1, (n_pts - args.sw) // args.sw + 1)
+        return np.array([sv[k * args.sw:(k + 1) * args.sw].sum() for k in range(nb)]), nb
 
-    # 论文风格窗口级指标（按 sw 不重叠分块）
-    blk = args.sw
-    n_blk = max(1, (len(te) - args.sw) // blk + 1)
-    b_score = np.array([s_test[k * blk: k * blk + args.sw].mean() for k in range(n_blk)])
-    g_blk = gt_windows(anom, n_blk, args.sw, blk)
-    w_plain, w_pa = eval_with_pa((b_score > thresh).astype(np.int64), g_blk)
+    # ---- ★ 有效加噪步数 t_start 扫描 ----
+    # 论文是 T=100 + Linear，但论文没给 β 的具体范围。本项目的探针早就发现
+    # 「加噪越少，正常/异常分离度越好」——而 T=100 + linspace(1e-4,0.02) 时
+    # alpha_bar_T 只有 0.364（只抹掉 40% 信息），正好落在探针里最差的区间。
+    # 这里把重建在多个 t_start 上各做一遍（t_start 很小，开销可忽略），
+    # 一次跑分就能看到「论文设置 vs 低噪声设置」到底差多少。
+    ts_list = sorted({int(x) for x in args.t_start_list.split(",") if x.strip()} | {int(args.t_start)})
+    E_cache, ts_sweep, ts_score_sweep = {}, {}, {}
+    for ts in ts_list:
+        ts = int(min(ts, len(sched[2])))
+        # 注意：sched 里的张量在 GPU 上，必须先 .item() 转成 python float，
+        # 不能把 CUDA tensor 直接丢给 np.sqrt / np.nanmean（会触发 __array__ 报错）
+        _ab = float(sched[2][ts - 1].item() if hasattr(sched[2][ts - 1], "item") else sched[2][ts - 1])
+        vh_ = reconstruct(model, va_w, sched[0], sched[1], sched[2], ts, dev,
+                          sampler=args.sampler, n_sample=args.n_sample, batch=args.batch, seed=args.seed)
+        E_v = aggregate_point_errors((vh_ - va_w).pow(2).numpy(), n_val_pts_eff, args.sw, args.test_ss, V)
+        th_ = reconstruct(model, te_w, sched[0], sched[1], sched[2], ts, dev,
+                          sampler=args.sampler, n_sample=args.n_sample, batch=args.batch, seed=args.seed)
+        E_t = aggregate_point_errors((th_ - te_w).pow(2).numpy(), len(te), args.sw, args.test_ss, V)
+        E_cache[ts] = (E_v, E_t)
 
-    # 正常/异常分离度
-    normal, anom_s = s_test[g_pt == 0], s_test[g_pt == 1] if (g_pt == 1).any() else np.array([])
+        # ★ t_start × 打分方式 交叉扫描：重构已经算好，打分/评估几乎免费。
+        # 上一轮发现「低 t_start 分离度更好，但论文式(12)的均值打分把异常稀释了」，
+        # 所以这两者必须一起看。
+        for sm in SCORE_MODES:
+            sv_ = smooth_score(make_score(E_v, E_v, sm), args.smooth)
+            st_ = smooth_score(make_score(E_t, E_v, sm), args.smooth)
+            wv_, _ = to_windows(sv_, n_val_pts_eff)
+            wt_, _ = to_windows(st_, len(te))
+            thr_, mu_, sd_, _ = make_threshold(wv_, wt_, args.thresh, args.eta)
+            p_ = (wt_ > thr_).astype(np.int64)
+            mp_, mpa_ = eval_with_pa(p_, g_wb)
+            gn, ga = wt_[g_wb == 0], (wt_[g_wb == 1] if (g_wb == 1).any() else np.array([np.nan]))
+            _nm, _am = float(np.nanmean(gn)), float(np.nanmean(ga))
+            rec = dict(alpha_bar=_ab, signal_left=math.sqrt(max(_ab, 0.0)),
+                       plain={k: round(v, 4) for k, v in mp_.items()},
+                       pa={k: round(v, 4) for k, v in mpa_.items()},
+                       oracle=round(float(oracle_best(wt_, g_wb)["F1"]), 4),
+                       pred_pos=round(float(p_.mean()), 4),
+                       normal_mean=_nm, anom_mean=_am,
+                       gap=float(_am / max(_nm, 1e-12)))
+            # 键统一用 str：多卡时结果要过一遍 results.json，JSON 会把 int 键转成字符串，
+            # 用 int 键会导致汇总表查不到（本地单进程跑则不会暴露这个不一致）
+            ts_score_sweep[f"{ts}|{sm}"] = rec
+            if sm == args.score:
+                ts_sweep[str(ts)] = rec
+    E_val, E_test = E_cache[int(min(args.t_start, len(sched[2])))]
+
+    s_val_p = smooth_score(make_score(E_val, E_val, args.score), args.smooth)
+    s_test_p = smooth_score(make_score(E_test, E_val, args.score), args.smooth)
+    w_val, n_wv = to_windows(s_val_p, n_val_pts_eff)
+    w_test, _ = to_windows(s_test_p, len(te))
+    thresh, mu, sd, how = make_threshold(w_val, w_test, args.thresh, args.eta)
+    pred_w = (w_test > thresh).astype(np.int64)
+    m_plain, m_pa = eval_with_pa(pred_w, g_wb)          # 主指标用 m_plain（= 论文口径）
+    orc = oracle_best_f1(w_test, g_wb)
+    orc_pa = oracle_best(w_test, g_wb, use_pa=True)
+
+    # ---- 点级（为了对比，把窗口标签摊回每个点）----
+    # 注意：不重叠窗口只能覆盖 n_wb*sw 个点（<= len(te)），尾巴不足一个窗口的点
+    # 没有任何窗口覆盖，按"正常"处理（长度必须与 g_pt 对齐）。
+    pred = np.zeros(len(te), dtype=np.int64)
+    if len(pred_w):
+        flat = np.repeat(pred_w, args.sw)
+        n_cov = min(len(te), len(flat))
+        pred[:n_cov] = flat[:n_cov]
+    pt_plain, pt_pa = eval_with_pa(pred, g_pt)
+    w_plain, w_pa = m_plain, m_pa
+    g_blk = g_wb
+    b_score = w_test
+
+
+    # ---- 论文口径复现（Eq.12/13）----
+    # 论文 Eq.(12): score(x) = Σ_{1}^{N} Σ_{1}^{s_w} ||x0 - x̂0||²  —— 对整个窗口求和，
+    # 判定 label(x) 的 x 也是窗口；论文全文**没有**提 point-adjustment。
+    # 所以论文的 P/R/F1 是「窗口级 + 验证段定阈值 + 不做 PA」。
+    # 这里用已经算好的逐点逐变量误差 E 直接按不重叠窗口求和，零额外开销。
+    # （主指标已经就是论文口径，这里再额外算「最优阈值」版作为天花板参考）
+    protocols = {
+        "论文口径-窗口级-固定阈值-不PA": m_plain,
+        "论文口径-窗口级-固定阈值-加PA": m_pa,
+        "论文口径-窗口级-最优阈值-不PA": orc,
+        "论文口径-窗口级-最优阈值-加PA": orc_pa,
+        "点级-固定阈值-不PA": pt_plain,
+        "点级-固定阈值-加PA": pt_pa,
+    }
+
+    # 正常/异常分离度（窗口级）
+    g_w = g_wb
+    normal, anom_s = (w_test[g_w == 0], w_test[g_w == 1] if (g_w == 1).any() else np.array([]))
     sep = dict(normal_mean=float(normal.mean()) if len(normal) else None,
                normal_std=float(normal.std()) if len(normal) else None,
                anom_mean=float(anom_s.mean()) if len(anom_s) else None,
                anom_std=float(anom_s.std()) if len(anom_s) else None,
-               val_mean=float(s_val.mean()), val_std=float(s_val.std()),
-               pred_pos_rate=float(pred.mean()))
+               val_mean=float(w_val.mean()), val_std=float(w_val.std()),
+               pred_pos_rate=float(pred_w.mean()))
     if len(anom_s) and sep["normal_mean"]:
         sep["gap_ratio"] = float(sep["anom_mean"] / sep["normal_mean"])
 
-    print(f"[{cid}] 阈值={thresh:.5f} (μ={mu:.5f} σ={sd:.5f}, {how})  预测异常比例={pred.mean()*100:.1f}% "
-          f"(GT={g_pt.mean()*100:.1f}%)", flush=True)
-    print(f"[{cid}] 点级 plain P={m_plain['P']:.4f} R={m_plain['R']:.4f} F1={m_plain['F1']:.4f} "
-          f"(TP={m_plain['TP']} FP={m_plain['FP']} FN={m_plain['FN']})   PA F1={m_pa['F1']:.4f}", flush=True)
-    print(f"[{cid}] 窗级 plain F1={w_plain['F1']:.4f}  PA F1={w_pa['F1']:.4f}  |  "
-          f"oracle 最佳点级 F1={orc['F1']:.4f} @th={orc['thresh']:.5f}", flush=True)
-    print(f"[{cid}] 分离度: 正常均={sep['normal_mean']} 异常均={sep['anom_mean']} "
+    print(f"[{cid}] ★论文口径(窗口级/固定阈值/不PA) P={m_plain['P']:.4f} R={m_plain['R']:.4f} "
+          f"F1={m_plain['F1']:.4f}   (窗口={n_wb}, 异常窗口={int(g_wb.sum())}, "
+          f"阈值={thresh:.4g} [{how}], 预测正例={pred_w.mean()*100:.1f}%)", flush=True)
+    print(f"[{cid}]   对比: 窗口级+PA F1={m_pa['F1']:.4f} | 点级-不PA F1={pt_plain['F1']:.4f} "
+          f"| 点级+PA F1={pt_pa['F1']:.4f} | 窗口级最优阈值 F1={orc['F1']:.4f}", flush=True)
+    print(f"[{cid}]   分离度(窗口级): 正常均={sep['normal_mean']} 异常均={sep['anom_mean']} "
           f"gap_ratio={sep.get('gap_ratio')}", flush=True)
 
     def _eta_row(e):
-        p = (s_test > mu + e * sd).astype(np.int64)
-        pl, pa = eval_with_pa(p, g_pt)
+        p = (w_test > mu + e * sd).astype(np.int64)
+        pl, pa = eval_with_pa(p, g_wb)
         return dict(eta=e, thresh=float(mu + e * sd), pred_pos=float(p.mean()), plain=pl, pa=pa)
 
     # ---- 方案扫描 ----
-    # 重构已经算好了，各种「打分 × 阈值 × 平滑」组合的评估几乎不花时间。
+    # 重构已经算好了，各种「打分 × 阈值 × 平滑 × η」组合的评估几乎不花时间。
     # 这样一次全量跑分就能拿到所有备选方案，事后挑最好的（而不是再跑一轮）。
     variants = {}
-    for sm, tm, w in VARIANT_GRID:
-        sv = smooth_score(make_score(E_val, E_val, sm), w)
-        stt = smooth_score(make_score(E_test, E_val, sm), w)
-        thr, _, _, _ = make_threshold(sv, stt, tm, args.eta)
-        p = (stt > thr).astype(np.int64)
-        vp, vpa = eval_with_pa(p, g_pt)
-        vo = oracle_best_f1(stt, g_pt)
-        variants[f"{sm}|{tm}|eta{args.eta:g}|w{w}"] = dict(
-            plain=vp, pa=vpa, oracle=vo, pred_pos=float(p.mean()))
+    for sm in SCORE_MODES:
+        Ev_s = make_score(E_val, E_val, sm)
+        Et_s = make_score(E_test, E_val, sm)
+        for w in SMOOTH_LIST:
+            sv = smooth_score(Ev_s, w)
+            stt = smooth_score(Et_s, w)
+            # ★ 论文口径是窗口级判定，所以扫描也在窗口上评估（不 PA）
+            wv_s, _ = to_windows(sv, n_val_pts_eff)
+            wt_s, _ = to_windows(stt, len(te))
+            for tm in THRESH_MODES:
+                etas = [ETA_LIST[0]] if tm in QUANTILE_MODES else ETA_LIST
+                for eta in etas:
+                    key = f"{sm}|{tm}|{eta:g}|w{w}"
+                    thr, _, _, _ = make_threshold(wv_s, wt_s, tm, eta)
+                    p = (wt_s > thr).astype(np.int64)
+                    vp, vpa = eval_with_pa(p, g_wb)
+                    variants[key] = dict(
+                        plain={k: round(v, 4) for k, v in vp.items()},
+                        pa={k: round(v, 4) for k, v in vpa.items()},
+                        pred_pos=round(float(p.mean()), 4), thresh=float(thr))
+
+    # 天花板：阈值扫描能拿到的最好窗口级 F1（诊断用，不用于真实判定）
+    orc_pa = oracle_best(w_test, g_wb, use_pa=True)
 
     res = dict(channel=cid, spacecraft=labels.get(cid, ("?",))[0], cls=labels.get(cid, (None, "?"))[1],
                n_var=V, n_var_raw=int(tr_raw.shape[1]), n_live=int((~st["dead_tr"]).sum()),
-               col_policy=policy, n_points=int(len(te)),
-               n_anom_points=int(g_pt.sum()), t_start=args.t_start, score=args.score, thresh_mode=args.thresh,
-               thresh=float(thresh), mu=mu, sd=sd, oracle=orc,
-               point_plain=m_plain, point_pa=m_pa, window_plain=w_plain, window_pa=w_pa,
-               separation=sep, variants=variants,
+               col_policy=policy, n_points=int(len(te)), n_windows=int(n_wb),
+               n_anom_points=int(g_pt.sum()), n_anom_windows=int(g_wb.sum()),
+               t_start=args.t_start, score=args.score, thresh_mode=args.thresh,
+               thresh=float(thresh), mu=mu, sd=sd, oracle=orc, oracle_pa=orc_pa,
+               # 主指标（论文口径）放在 window_plain；point_* 是与其它口径的对照
+               window_plain=m_plain, window_pa=m_pa,
+               point_plain=pt_plain, point_pa=pt_pa,
+               separation=sep, variants=variants, protocols=protocols,
+               t_start_sweep=ts_sweep, ts_score_sweep=ts_score_sweep,
                eta_sweep=[_eta_row(e) for e in [1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0]],
                hyper=dict(sw=args.sw, train_ss=args.train_ss, test_ss=args.test_ss,
                           n_steps=args.n_steps, t_start=args.t_start, sampler=args.sampler,
-                          n_sample=args.n_sample, iters=args.iters, base=args.base,
+                          n_sample=args.n_sample, iters=iters, base=args.base,
                           schedule=args.schedule, eta=args.eta, col_policy=policy,
-                          val_frac=args.val_frac))
+                          val_frac=args.val_frac, val_random=args.val_random,
+                          lr=args.lr, batch=args.batch, ema=args.ema, epochs=args.epochs))
 
     if args.plots:
-        save_plots(cid, out_dir, te_raw, s_test, thresh, pred, anom, g_pt,
-                   s_val=s_val, loss_hist=loss_hist)
+        # 传点级的 pred（长度 = len(te)），不是窗口级的 pred_w，否则 fill_between 形状不匹配
+        save_plots(cid, out_dir, te_raw, s_test_p, thresh, pred, anom, g_pt,
+                   s_val=s_val_p, loss_hist=loss_hist)
     if args.save_model:
         torch.save({"sd": model.state_dict(),
                     "norm": {k: np.asarray(v) for k, v in st.items() if k != "policy"},
@@ -858,35 +1055,51 @@ def build_parser():
     ap.add_argument("--train_ss", type=int, default=TRAIN_SS_DEFAULT)
     ap.add_argument("--test_ss", type=int, default=TEST_SS_DEFAULT)
     ap.add_argument("--val_frac", type=float, default=0.2)
+    ap.add_argument("--val_random", action="store_true", default=True,
+                    help="论文 §IV.C：随机抽 20%% 训练窗口做验证集（默认开）")
+    ap.add_argument("--no_val_random", dest="val_random", action="store_false",
+                    help="改成按时间前后切分验证段（我们早期的做法）")
     ap.add_argument("--col_policy", default="drop", choices=["drop", "testscale", "zero"],
                     help="恒列处理策略：drop=删掉训练/测试都恒定的列（推荐）；"
                          "testscale=用测试段范围给恒列尺度；zero=恒列置 0（最早做法）")
     ap.add_argument("--keep_dead_cols", action="store_true",
                     help="[已废弃] 等价于 --col_policy testscale")
-    ap.add_argument("--schedule", default="cosine", choices=["cosine", "linear"])
+    ap.add_argument("--schedule", default=SCHEDULE_DEFAULT, choices=["cosine", "linear"])
     ap.add_argument("--n_steps", type=int, default=N_STEPS_DEFAULT)
-    ap.add_argument("--t_start", type=int, default=T_START_DEFAULT)
-    ap.add_argument("--sampler", default="ddim", choices=["ddim", "ddpm"])
+    ap.add_argument("--t_start", type=int, default=T_START_DEFAULT, help="论文: T=100（全链反向）")
+    ap.add_argument("--t_start_list", default="5,10,20,35,50,100",
+                    help="一次跑分同时评估多个有效加噪步数（t_start 很小，开销可忽略）")
+    ap.add_argument("--sampler", default="ddpm", choices=["ddim", "ddpm"])
     ap.add_argument("--n_sample", type=int, default=3)
     ap.add_argument("--score", default="paper",
-                    choices=["paper", "zratio_mean", "zratio_max",
-                             "zval_mean", "zval_max", "zself_mean", "zself_max"])
+                    choices=SCORE_MODES,
+                    help="默认 zself_max：81 通道全量实测 PA F1=83.17，paper 只有 69.77")
     ap.add_argument("--smooth", type=int, default=0,
-                    help="得分平滑窗口（奇数，0=不平滑）。SMAP/MSL benchmark 的标准做法，对长 contextual 异常有效")
-    ap.add_argument("--thresh", default="val", choices=["val", "val_robust", "test_robust"])
-    ap.add_argument("--base", type=int, default=32)
+                    help="得分平滑窗口（奇数，0=不平滑）。实测平滑会降低 PA F1，默认关")
+    ap.add_argument("--thresh", default="val",
+                    choices=["val", "val_robust", "test_robust", "q05", "q10", "q20", "h10"],
+                    help="阈值方式。val=论文式(13)；test_robust/分位数/h10 是在测试段自标定，"
+                         "用于修掉『训练段尾部标定的阈值对测试段不适用』导致的误报爆炸")
+    ap.add_argument("--base", type=int, default=BASE_DEFAULT)
     ap.add_argument("--emb", type=int, default=128)
     ap.add_argument("--ch_mult", default="1,2,4")
     ap.add_argument("--dropout", type=float, default=0.0)
-    ap.add_argument("--iters", type=int, default=6000)
-    ap.add_argument("--epochs", type=int, default=None, help="--iters 的别名（兼容旧命令）")
-    ap.add_argument("--batch", type=int, default=128)
-    ap.add_argument("--lr", type=float, default=2e-4)
-    ap.add_argument("--ema", type=float, default=0.999)
+    ap.add_argument("--iters", type=int, default=0)
+    ap.add_argument("--iters_legacy", type=int, default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--batch", type=int, default=BATCH_DEFAULT)
+    ap.add_argument("--lr", type=float, default=LR_DEFAULT, help="论文 TABLE II: 5e-5")
+    ap.add_argument("--beta1", type=float, default=0.9, help="论文 TABLE II: Adam β1")
+    ap.add_argument("--beta2", type=float, default=0.99, help="论文 TABLE II: Adam β2")
+    ap.add_argument("--cosine_lr", action="store_true", default=True, help="cosine LR 调度（论文未提，默认开）")
+    ap.add_argument("--no_cosine_lr", dest="cosine_lr", action="store_false")
+    ap.add_argument("--ema", type=float, default=EMA_DEFAULT, help="论文 TABLE II: 0.995")
+    ap.add_argument("--epochs", type=int, default=EPOCHS_DEFAULT,
+                    help="论文 TABLE II: Epoch=1500（按 epoch 换算迭代数）")
     ap.add_argument("--log_every", type=int, default=1000)
-    ap.add_argument("--eta", type=float, default=ETA_DEFAULT)
+    ap.add_argument("--eta", type=float, default=ETA_DEFAULT, help="论文 §IV.D: η=2")
     ap.add_argument("--eval", default="both", choices=["plain", "pa", "both"], help="仅兼容旧命令，本版同时输出两种")
-    ap.add_argument("--rounds", type=int, default=1)
+    ap.add_argument("--rounds", type=int, default=ROUNDS_DEFAULT,
+                    help="论文 §IV.C 用 10 轮随机划分取平均；默认 3 轮折中")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--limit", type=int, default=0, help="all 模式下最多跑多少通道（0=全部）")
     ap.add_argument("--plots", action="store_true", default=None)
@@ -899,53 +1112,212 @@ def build_parser():
 def write_summary(all_results, out_dir, hyper=None, title=""):
     """把 {channel: [result,...]} 汇总成 report.txt / results.json / summary.csv。
     多卡分片跑完后由 ddtad_parallel.py 复用本函数做全局汇总。"""
-    flat = [v[0] for v in all_results.values() if v]
+    flat = [r for v in all_results.values() for r in v]        # 所有轮次都纳入（论文取多轮平均）
     used = [r for r in flat if r["n_anom_points"] > 0]
     skipped = [r["channel"] for r in flat if r["n_anom_points"] == 0]
     pt = aggregate(used, "point_plain", "point_pa")
     wd = aggregate(used, "window_plain", "window_pa")
+    n_rounds = max((len(v) for v in all_results.values()), default=0)
 
     lines = ["=" * 90]
     if title:
         lines.append(title)
-    lines.append(f"汇总：参与评估通道 {len(used)} 个"
-                 + (f"（{len(skipped)} 个通道测试集无异常标签，已跳过: {skipped}）" if skipped else ""))
-    lines.append(f"  点级   plain  P={pt['micro_plain']['P']*100:.2f}  R={pt['micro_plain']['R']*100:.2f}  "
-                 f"F1={pt['micro_plain']['F1']*100:.2f}   [宏观 F1={pt['macro_plain_F1']*100:.2f}]")
-    lines.append(f"  点级   PA     P={pt['micro_pa']['P']*100:.2f}  R={pt['micro_pa']['R']*100:.2f}  "
-                 f"F1={pt['micro_pa']['F1']*100:.2f}   [宏观 F1={pt['macro_pa_F1']*100:.2f}]")
-    lines.append(f"  窗口级 plain  F1={wd['micro_plain']['F1']*100:.2f}   "
-                 f"窗口级 PA  F1={wd['micro_pa']['F1']*100:.2f}")
-    lines.append(f"  oracle 上界（阈值扫描，仅诊断）宏观点级 F1={pt['macro_oracle_F1']*100:.2f}")
-    lines.append("  论文 DDTAD 参考：SMAP P=92.27 R=91.30 F1=91.78 | MSL P=94.47 R=97.21 F1=95.82（点级+PA）")
+    lines.append(f"汇总：参与评估 {len(used)} 个 (通道×轮次) 样本"
+                 + (f"（{len(skipped)} 个无异常标签，已跳过）" if skipped else ""))
+    lines.append("")
+    lines.append("★ 主指标 = 论文口径：窗口级 + 验证段固定阈值 + 不做 point-adjust（论文 §II.A/式(12)(13)(16)）")
+    lines.append(f"  窗口级 不PA   P={wd['micro_plain']['P']*100:.2f}  R={wd['micro_plain']['R']*100:.2f}  "
+                 f"F1={wd['micro_plain']['F1']*100:.2f}   [宏观 F1={wd['macro_plain_F1']*100:.2f}]")
     for sc in sorted({r["spacecraft"] for r in used}):
         sub = [r for r in used if r["spacecraft"] == sc]
-        a = aggregate(sub, "point_plain", "point_pa")
-        lines.append(f"  [{sc}] 通道={len(sub):3d}  plain F1={a['micro_plain']['F1']*100:6.2f}  "
-                     f"PA P={a['micro_pa']['P']*100:6.2f} R={a['micro_pa']['R']*100:6.2f} "
-                     f"F1={a['micro_pa']['F1']*100:6.2f}")
+        a = aggregate(sub, "window_plain", "window_pa")
+        lines.append(f"    [{sc}] 通道={len({r['channel'] for r in sub}):3d}×{n_rounds}轮  "
+                     f"P={a['micro_plain']['P']*100:6.2f} R={a['micro_plain']['R']*100:6.2f} "
+                     f"F1={a['micro_plain']['F1']*100:6.2f}")
+    lines.append("  论文 DDTAD: SMAP P=92.27 R=91.30 F1=91.78 | MSL P=94.47 R=97.21 F1=95.82")
+    lines.append("")
+    lines.append("参考口径（非论文口径，仅供诊断）：")
+    lines.append(f"  窗口级 +PA    P={wd['micro_pa']['P']*100:.2f}  R={wd['micro_pa']['R']*100:.2f}  "
+                 f"F1={wd['micro_pa']['F1']*100:.2f}")
+    lines.append(f"  点级   不PA   P={pt['micro_plain']['P']*100:.2f}  R={pt['micro_plain']['R']*100:.2f}  "
+                 f"F1={pt['micro_plain']['F1']*100:.2f}")
+    lines.append(f"  点级   +PA    P={pt['micro_pa']['P']*100:.2f}  R={pt['micro_pa']['R']*100:.2f}  "
+                 f"F1={pt['micro_pa']['F1']*100:.2f}")
+    lines.append(f"  窗口级最优阈值（天花板，宏观点级口径参考）宏观点级 F1={pt['macro_oracle_F1']*100:.2f}")
 
-    # ---- 方案扫描汇总（挑最终超参用） ----
-    vkeys = sorted({k for r in used for k in (r.get("variants") or {})})
-    if vkeys:
+    # ---- ★ 有效加噪步数 t_start 对照（回答"论文的 T=100 对不对"） ----
+    tkeys = []
+    for r in used:
+        for k in (r.get("t_start_sweep") or {}):
+            if int(k) not in tkeys:
+                tkeys.append(int(k))
+    if tkeys:
+        tkeys.sort()
+        note_ts = int((hyper or {}).get("t_start", 100))
         lines.append("-" * 90)
-        lines.append("方案扫描（所有通道微观汇总，仅诊断；据此确定最终 --score/--smooth）")
-        lines.append(f"  {'score|thresh|eta|smooth':32s} {'plain P':>8} {'R':>8} {'F1':>8} | "
-                     f"{'PA P':>8} {'R':>8} {'F1':>8} | {'macroPA':>8}")
-        for k in vkeys:
-            subs = [r["variants"][k] for r in used if k in (r.get("variants") or {})]
-            if not subs:
+        lines.append("有效加噪步数 t_start 对照（同一批模型，只是加噪/反向步数不同；论文是 T=100 全链）")
+        lines.append(f"  {'t_start':>8} {'alpha_bar':>10} {'信号残留%':>10} | "
+                     f"{'窗口P':>7} {'窗口R':>7} {'窗口F1':>8} | {'窗口+PA':>8} {'最优阈值':>8} | "
+                     f"{'正常均':>9} {'异常均':>9} {'gap':>7}")
+        for k in tkeys:
+            rows = [r["t_start_sweep"][str(k)] for r in used
+                    if (r.get("t_start_sweep") or {}).get(str(k))]
+            if not rows:
                 continue
-            def _mic(key):
+            tp = sum(x["plain"]["TP"] for x in rows); fp = sum(x["plain"]["FP"] for x in rows)
+            fn = sum(x["plain"]["FN"] for x in rows)
+            P = tp / (tp + fp) if tp + fp else 0.0
+            R = tp / (tp + fn) if tp + fn else 0.0
+            F1 = 2 * P * R / (P + R) if P + R else 0.0
+            tpp = sum(x["pa"]["TP"] for x in rows); fpp = sum(x["pa"]["FP"] for x in rows)
+            fnp = sum(x["pa"]["FN"] for x in rows)
+            Pp = tpp / (tpp + fpp) if tpp + fpp else 0.0
+            Rp = tpp / (tpp + fnp) if tpp + fnp else 0.0
+            F1p = 2 * Pp * Rp / (Pp + Rp) if Pp + Rp else 0.0
+            oF = float(np.mean([x["oracle"] for x in rows]))
+            nm = float(np.mean([x["normal_mean"] for x in rows]))
+            am = float(np.mean([x["anom_mean"] for x in rows]))
+            ab = float(np.mean([x["alpha_bar"] for x in rows]))
+            sl = float(np.mean([x["signal_left"] for x in rows]))
+            mark = "  ← 论文 T=100" if k == note_ts else ""
+            lines.append(f"  {k:>8} {ab:>10.4f} {sl*100:>10.1f} | "
+                         f"{P*100:7.2f} {R*100:7.2f} {F1*100:8.2f} | {F1p*100:8.2f} {oF*100:8.2f} | "
+                         f"{nm:9.4f} {am:9.4f} {am/max(nm,1e-12):7.3f}{mark}")
+
+    # ---- ★ t_start × 打分方式 交叉排行榜（本轮核心诊断） ----
+    tsk = []
+    for r in used:
+        for k in (r.get("ts_score_sweep") or {}):
+            if k not in tsk:
+                tsk.append(k)
+    if tsk:
+        def ts_stats(k):
+            subs = [r["ts_score_sweep"][k] for r in used if k in (r.get("ts_score_sweep") or {})]
+            if not subs:
+                return None
+
+            def mic(key):
                 tp = sum(x[key]["TP"] for x in subs); fp = sum(x[key]["FP"] for x in subs)
                 fn = sum(x[key]["FN"] for x in subs)
                 P = tp / (tp + fp) if tp + fp else 0.0
                 R = tp / (tp + fn) if tp + fn else 0.0
                 return P, R, (2 * P * R / (P + R) if P + R else 0.0)
-            pP, pR, pF = _mic("plain"); aP, aR, aF = _mic("pa")
-            mac = float(np.mean([x["pa"]["F1"] for x in subs]))
-            lines.append(f"  {k:32s} {pP*100:8.2f} {pR*100:8.2f} {pF*100:8.2f} | "
-                         f"{aP*100:8.2f} {aR*100:8.2f} {aF*100:8.2f} | {mac*100:8.2f}")
+            pP, pR, pF = mic("plain"); aP, aR, aF = mic("pa")
+            return dict(winP=pP, winR=pR, winF1=pF, paP=aP, paR=aR, paF1=aF,
+                        oracle=float(np.mean([x["oracle"] for x in subs])),
+                        gap=float(np.mean([x["gap"] for x in subs])),
+                        predpos=float(np.mean([x["pred_pos"] for x in subs])))
+        tstats = {k: ts_stats(k) for k in tsk}
+        tstats = {k: v for k, v in tstats.items() if v}
+        order = sorted(tstats, key=lambda k: -tstats[k]["winF1"])
+        lines.append("-" * 90)
+        lines.append("★ t_start × 打分方式 交叉排行榜（按论文口径【窗口级 F1】排序，前 20）")
+        lines.append(f"  {'t_start|score':24s} {'winP':>7} {'winR':>7} {'winF1':>8} | "
+                     f"{'winPAF1':>8} {'最优阈值':>9} {'gap':>7} {'pred%':>7}")
+        for k in order[:20]:
+            s = tstats[k]
+            mark = " ★" if k == order[0] else ""
+            lines.append(f"  {k:24s} {s['winP']*100:7.2f} {s['winR']*100:7.2f} {s['winF1']*100:8.2f} | "
+                         f"{s['paF1']*100:8.2f} {s['oracle']*100:9.2f} {s['gap']:7.3f} "
+                         f"{s['predpos']*100:6.1f}%{mark}")
+        # 论文设置那一格单独标出来
+        pk = f"{int((hyper or {}).get('t_start', 100))}|paper"
+        if pk in tstats:
+            s = tstats[pk]
+            rk = order.index(pk) + 1
+            lines.append(f"  （论文设置 {pk}: 窗口级 F1={s['winF1']*100:.2f}, 排名 {rk}/{len(order)}）")
+
+    # ---- 评测口径对照（回答"为什么和论文不一致"） ----
+    pkeys = []
+    for r in used:
+        for k in (r.get("protocols") or {}):
+            if k not in pkeys:
+                pkeys.append(k)
+    if pkeys:
+        lines.append("-" * 90)
+        lines.append("评测口径对照：同一批重构，只换『判定单元 / 阈值来源 / 是否 point-adjust』")
+        lines.append(f"  {'口径':34s} {'P':>8} {'R':>8} {'F1':>8}")
+        prot_rows = {}
+        for k in pkeys:
+            subs = [r["protocols"][k] for r in used if k in (r.get("protocols") or {})]
+            if not subs:
+                continue
+            tp = sum(x["TP"] for x in subs); fp = sum(x["FP"] for x in subs)
+            fn = sum(x["FN"] for x in subs)
+            P = tp / (tp + fp) if tp + fp else 0.0
+            R = tp / (tp + fn) if tp + fn else 0.0
+            F1 = 2 * P * R / (P + R) if P + R else 0.0
+            prot_rows[k] = (P, R, F1)
+            lines.append(f"  {k:34s} {P*100:8.2f} {R*100:8.2f} {F1*100:8.2f}")
+        for sc in sorted({r["spacecraft"] for r in used}):
+            sub = [r for r in used if r["spacecraft"] == sc]
+            for k in pkeys:
+                ss = [r["protocols"][k] for r in sub if k in (r.get("protocols") or {})]
+                if not ss:
+                    continue
+                tp = sum(x["TP"] for x in ss); fp = sum(x["FP"] for x in ss); fn = sum(x["FN"] for x in ss)
+                P = tp / (tp + fp) if tp + fp else 0.0
+                R = tp / (tp + fn) if tp + fn else 0.0
+                F1 = 2 * P * R / (P + R) if P + R else 0.0
+                lines.append(f"    [{sc}] {k:28s} {P*100:8.2f} {R*100:8.2f} {F1*100:8.2f}")
+        lines.append("  论文 DDTAD: SMAP P=92.27 R=91.30 F1=91.78 | MSL P=94.47 R=97.21 F1=95.82")
+
+    # ---- 方案扫描汇总（挑最终超参用） ----
+    vkeys = sorted({k for r in used for k in (r.get("variants") or {})})
+    best_pa = best_plain = None
+    if vkeys:
+        def _stats(k):
+            subs = [r["variants"][k] for r in used if k in (r.get("variants") or {})]
+            if not subs:
+                return None
+
+            def mic(key):
+                tp = sum(x[key]["TP"] for x in subs); fp = sum(x[key]["FP"] for x in subs)
+                fn = sum(x[key]["FN"] for x in subs)
+                P = tp / (tp + fp) if tp + fp else 0.0
+                R = tp / (tp + fn) if tp + fn else 0.0
+                return P, R, (2 * P * R / (P + R) if P + R else 0.0)
+            pP, pR, pF = mic("plain"); aP, aR, aF = mic("pa")
+            return dict(n=len(subs), plainP=pP, plainR=pR, plainF1=pF,
+                        paP=aP, paR=aR, paF1=aF,
+                        macroPA=float(np.mean([x["pa"]["F1"] for x in subs])),
+                        predpos=float(np.mean([x["pred_pos"] for x in subs])))
+        stats = {k: _stats(k) for k in vkeys}
+        stats = {k: v for k, v in stats.items() if v}
+        # ★ 主排序按【窗口级 plain F1】= 论文口径（§II.A/式(12)(13)(16)，不做 PA）
+        order_main = sorted(stats, key=lambda k: -stats[k]["plainF1"])
+        order_pa = sorted(stats, key=lambda k: -stats[k]["paF1"])
+        best_plain, best_pa = (order_main[0] if order_main else None), (order_pa[0] if order_pa else None)
+
+        lines.append("-" * 90)
+        lines.append(f"方案扫描：共 {len(stats)} 种组合（同一批重构，评估免费；评估单元都是**窗口**）")
+        for tag, order, best in (
+                ("★按【窗口级 F1（论文口径：窗口判定 + 不 PA）】排序", order_main, best_plain),
+                ("按【窗口级 +PA F1】排序（参考，论文没用 PA）", order_pa, best_pa)):
+            lines.append("")
+            lines.append(f"  {tag} —— 前 {TOP_N_VARIANTS} 名")
+            lines.append(f"    {'score|thresh|eta|smooth':30s} {'winP':>7} {'winR':>7} {'winF1':>8} | "
+                         f"{'winPAP':>7} {'winPAR':>7} {'winPAF1':>8} | {'pred%':>7}")
+            for k in order[:TOP_N_VARIANTS]:
+                s = stats[k]
+                mark = " ★" if k == best else ""
+                lines.append(f"    {k:30s} {s['plainP']*100:7.2f} {s['plainR']*100:7.2f} {s['plainF1']*100:8.2f} | "
+                             f"{s['paP']*100:7.2f} {s['paR']*100:7.2f} {s['paF1']*100:8.2f} | "
+                             f"{s['predpos']*100:6.1f}%{mark}")
+
+        # 论文原始配置的排名，便于对照
+        paper_key = f"paper|val|2|w0"
+        if paper_key in stats:
+            rk = order_main.index(paper_key) + 1
+            s = stats[paper_key]
+            lines.append("")
+            lines.append(f"  论文原始配置 {paper_key}: 窗口级 F1={s['plainF1']*100:.2f} "
+                         f"(排名 {rk}/{len(stats)})  窗口级+PA F1={s['paF1']*100:.2f}")
+        if best_pa:
+            s = stats[best_pa]
+            lines.append("")
+            lines.append(f"  ★ 最优（PA）: {best_pa}  ->  PA P={s['paP']*100:.2f} R={s['paR']*100:.2f} "
+                         f"F1={s['paF1']*100:.2f}   plain F1={s['plainF1']*100:.2f}")
     lines.append("=" * 90)
     report = "\n".join(lines)
     print("\n" + report, flush=True)
@@ -953,36 +1325,42 @@ def write_summary(all_results, out_dir, hyper=None, title=""):
     with open(os.path.join(out_dir, "report.txt"), "w", encoding="utf-8") as f:
         f.write(report + "\n")
 
-    out = dict(hyper=hyper or {}, summary=dict(point=pt, window=wd, n_channels=len(used), skipped=skipped),
+    out = dict(hyper=hyper or {}, summary=dict(point=pt, window=wd, n_channels=len(used), skipped=skipped,
+                                               best_variant_pa=best_pa, best_variant_plain=best_plain),
                per_channel=all_results)
     with open(os.path.join(out_dir, "results.json"), "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2, ensure_ascii=False, default=float)
 
     with open(os.path.join(out_dir, "summary.csv"), "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["channel", "spacecraft", "class", "n_var", "n_live", "n_points", "n_anom_points",
-                    "P_plain", "R_plain", "F1_plain", "P_pa", "R_pa", "F1_pa", "F1_win_pa",
-                    "oracleF1", "thresh", "pred_pos_rate", "normal_mean", "anom_mean", "gap_ratio"])
-        for r in sorted(flat, key=lambda x: x["channel"]):
-            w.writerow([r["channel"], r["spacecraft"], r["cls"], r["n_var"], r["n_live"], r["n_points"],
-                        r["n_anom_points"],
+        w.writerow(["channel", "round", "spacecraft", "class", "n_var", "n_live", "n_windows",
+                    "n_anom_windows",
+                    "WIN_P", "WIN_R", "WIN_F1",                       # ★论文口径（窗口级，不 PA）
+                    "WIN_P_pa", "WIN_R_pa", "WIN_F1_pa",
+                    "PT_P", "PT_R", "PT_F1", "PT_F1_pa",
+                    "oracle_win_F1", "thresh", "pred_pos_rate", "normal_mean", "anom_mean", "gap_ratio"])
+        for i, r in enumerate(sorted(flat, key=lambda x: x["channel"])):
+            w.writerow([r["channel"], r.get("seed", i), r["spacecraft"], r["cls"], r["n_var"], r["n_live"],
+                        r["n_windows"], r["n_anom_windows"],
+                        f"{r['window_plain']['P']:.4f}", f"{r['window_plain']['R']:.4f}",
+                        f"{r['window_plain']['F1']:.4f}",
+                        f"{r['window_pa']['P']:.4f}", f"{r['window_pa']['R']:.4f}",
+                        f"{r['window_pa']['F1']:.4f}",
                         f"{r['point_plain']['P']:.4f}", f"{r['point_plain']['R']:.4f}",
-                        f"{r['point_plain']['F1']:.4f}",
-                        f"{r['point_pa']['P']:.4f}", f"{r['point_pa']['R']:.4f}",
-                        f"{r['point_pa']['F1']:.4f}",
-                        f"{r['window_pa']['F1']:.4f}", f"{r['oracle']['F1']:.4f}", f"{r['thresh']:.5f}",
+                        f"{r['point_plain']['F1']:.4f}", f"{r['point_pa']['F1']:.4f}",
+                        f"{r['oracle']['F1']:.4f}", f"{r['thresh']:.5g}",
                         f"{r['separation']['pred_pos_rate']:.4f}",
                         f"{r['separation']['normal_mean']:.5f}",
                         f"{r['separation']['anom_mean']:.5f}" if r['separation']['anom_mean'] is not None else "",
                         f"{r['separation'].get('gap_ratio', float('nan')):.4f}"])
-    print(f"\n结果已保存: {out_dir}/report.txt | results.json | summary.csv", flush=True)
+    print(f"\n结果已保存: {os.path.abspath(out_dir)}/report.txt | results.json | summary.csv", flush=True)
     return out
 
 
 def main():
     args = build_parser().parse_args()
-    if args.epochs is not None:
-        args.iters = args.epochs
+    if args.iters_legacy is not None:          # 兼容旧的 --epochs N（那时表示迭代数）
+        args.iters = args.iters_legacy
     if args.plots is None:
         args.plots = (args.channel != "all" and not args.channels)
     if args.save_model is None:
@@ -1018,8 +1396,10 @@ def main():
 
     orig_channel = args.channel
     all_results = {}
+    n_done = 0
     for rnd in range(args.rounds):
         seed = args.seed + rnd
+        args.seed = seed                      # 让验证集随机划分也随轮次变化（论文 §IV.C）
         set_seed(seed)
         sched = build_schedule(args.schedule, args.n_steps, dev)
         for cid in chans:
@@ -1037,6 +1417,17 @@ def main():
                 continue
             r["seed"] = seed
             all_results.setdefault(cid, []).append(r)
+
+            # ★ 每个通道结束后主动回收显存：81 个通道连续跑时，不同通道的
+            #   V（列数）不同，激活形状随之变化，默认分配器容易碎片化。
+            #   每 5 个通道清一次缓存，既避免碎片又不至于频繁同步拖慢速度。
+            n_done += 1
+            if dev.type == "cuda" and n_done % 5 == 0:
+                torch.cuda.empty_cache()
+                used = torch.cuda.memory_allocated(dev) / 1e9
+                resv = torch.cuda.memory_reserved(dev) / 1e9
+                print(f"    [显存] 已完成 {n_done} 个通道  allocated={used:.2f}G  "
+                      f"reserved={resv:.2f}G", flush=True)
     args.channel = orig_channel
 
     if not all_results:

@@ -34,7 +34,7 @@ ddtad_parallel.py —— 多卡并行调度器（通道级并行，卡数自动�
   python ddtad_parallel.py --workers 10 --prog ddtad_run.py --out_dir out/all
 """
 
-import os, sys, json, time, argparse, subprocess, glob
+import os, sys, json, time, re, argparse, subprocess, glob
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import numpy as np
@@ -144,6 +144,29 @@ def main():
         print(f"[启动] shard{i} -> GPU{gpu}  日志: {args.out_dir}/shard{i}.log", flush=True)
 
     print(f"\n全部启动，等待完成（可另开终端 tail -f {args.out_dir}/shard0.log 看进度）...\n", flush=True)
+
+    # ★ 多卡绑定核验：每个子进程都设了 CUDA_VISIBLE_DEVICES=<gpu>，
+    #   子程序会把 CVD 打进横幅（`... CVD=3`）。这里等几秒后回读日志确认
+    #   "shard i 真的跑在 GPU i 上"，而不是静默地全挤在 cuda:0。
+    time.sleep(12)
+    bind_ok, bind_bad = 0, []
+    for (i, gpu, p, log, shard_dir, s) in procs:
+        txt = _read_head(os.path.join(args.out_dir, f"shard{i}.log"))
+        m = re.search(r"CVD=(\S+)", txt)
+        if m is None:
+            bind_bad.append((i, gpu, "日志里没看到 CVD（子程序可能还没打印）"))
+        elif m.group(1) != str(gpu):
+            bind_bad.append((i, gpu, f"实际 CVD={m.group(1)}"))
+        else:
+            bind_ok += 1
+    if bind_bad:
+        print(f"[警告] 多卡绑定核验：{bind_ok} 个正确，以下分片的绑卡与预期不符：", flush=True)
+        for i, gpu, why in bind_bad:
+            print(f"        shard{i} 期望 GPU{gpu}，{why}", flush=True)
+    else:
+        print(f"[多卡核验] {bind_ok}/{len(procs)} 个分片都跑在预期的 GPU 上 ✔", flush=True)
+    print(flush=True)
+
     fail = []
     # 进度标记：每完成一个通道，子程序会打印这一串
     done_token = "✔全部完成" if args.prog.endswith("ddtad_probe.py") else "分离度:"
@@ -225,6 +248,15 @@ def _count_in(path, token):
         return n
     except Exception:
         return 0
+
+
+def _read_head(path, nbytes=4000):
+    """读日志开头若干字节（用于核验子进程的绑卡信息）"""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read(nbytes)
+    except Exception:
+        return ""
 
 
 def torch_count():

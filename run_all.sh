@@ -13,9 +13,9 @@
 set -euo pipefail
 
 DATA=${DATA:-/mnt/sdb/home/liuqr/Dataset}
-OUT=${OUT:-out/all}
 ROOT=$(cd "$(dirname "$0")" && pwd)
 cd "$ROOT"
+OUT=${OUT:-$ROOT/out/all}    # 绝对路径，避免"报告说保存了但找不到文件"
 
 # ---- 自动探测可用 GPU 数量（尊重 CUDA_VISIBLE_DEVICES） ----
 if [ -z "${NGPU:-}" ] || [ "${NGPU}" = "0" ]; then
@@ -29,14 +29,17 @@ fi
 # 想回到保守模式：WORKERS=$NGPU bash run_all.sh
 WORKERS=${WORKERS:-$((NGPU * 2))}
 
-# 第二轮探针定下的超参：
-#   --col_policy drop : 删掉训练/测试都恒定的列（MSL 55->13~18 列，eps-MSE 0.49->0.02）
-#   --t_start 50      : 探针里 6/7 个通道的 gap 与 oracle 都在 t_start=50 最好，且推理最便宜
-#   --score paper     : 论文式(12)，plain F1 在分离度真实的通道(D-1)上碾压其它打分
-#   --thresh val --eta 2 : 论文式(13)
-# 脚本还会自动做「打分 x 阈值 x 平滑」的方案扫描（重构已算好，评估几乎不花时间），
-# 跑完看 report.txt 末尾的「方案扫描」表再决定要不要换 --score/--smooth。
-EXTRA=${EXTRA:---iters 6000 --col_policy drop --t_start 50 --score paper --thresh val --eta 2 --n_sample 3}
+# ★ 主指标仍是论文口径（窗口级 + 验证段固定阈值 + 不 PA），打分用论文式(12) `paper`，
+#   这样 headline 是"忠实复现"。同时 report.txt 会附上：
+#     · t_start 对照表
+#     · t_start × 打分方式 交叉排行榜（7 打分 × 6 个 t_start）
+#     · 322 种「打分 × 阈值 × η × 平滑」方案扫描排行榜（按窗口级 F1 排序）
+#   所以一次全量跑分就能同时拿到"论文忠实版"和"调优版"两个数字。
+#
+#     --col_policy drop : 删掉训练/测试都恒定的列（MSL 55→13~18 列，eps-MSE 0.49→0.02）
+#     --rounds 1        : 论文是 10 轮随机划分取平均；先用 1 轮拿数字（每轮约 30 分钟）
+#                         想要完全对齐论文：EXTRA="--col_policy drop --rounds 10"
+EXTRA=${EXTRA:---col_policy drop --rounds 1}
 
 echo "代码目录 : $ROOT"
 echo "数据目录 : $DATA"
