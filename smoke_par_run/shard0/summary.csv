@@ -1,2 +1,0 @@
-channel,spacecraft,class,n_var,n_live,n_points,n_anom_points,P_plain,R_plain,F1_plain,P_pa,R_pa,F1_pa,F1_win_pa,oracleF1,thresh,pred_pos_rate,normal_mean,anom_mean,gap_ratio
-E-1,SMAP,"[contextual, contextual]",24,18,8516,508,0.0350,0.0098,0.0154,0.7756,0.9390,0.8495,0.0000,0.1078,0.05557,0.0168,0.03161,0.03158,0.9992

@@ -1,25 +1,36 @@
 #!/usr/bin/env bash
 # =====================================================================
-# DDTAD 第二轮机跑脚本（4×4090 多卡并行版）
+# DDTAD 诊断脚本（多卡并行，卡数自动探测）
 #   用法:  bash run_probe.sh
-#   可选:  DATA=/path/to/Dataset NGPU=4 CHANS=E-1,D-1 bash run_probe.sh
+#   可选:  DATA=/path/to/Dataset NGPU=5 bash run_probe.sh
 #
-# 流程：环境自检 → 单卡冒烟 → 多卡并行自检(探针路径) → 多卡并行自检(主程序+合并)
-#       → 全通道数据体检 → 正式诊断探针(4卡) → 打包
+# 流程：环境自检(逐卡) → 单卡冒烟 → 多卡自检(探针路径) → 多卡自检(主程序+合并)
+#       → 全通道数据体检 → 正式诊断探针 → 打包 → 分片日志体检
 # =====================================================================
 set -euo pipefail
 
 DATA=${DATA:-/mnt/sdb/home/liuqr/Dataset}
-NGPU=${NGPU:-4}
 CHANS=${CHANS:-E-1,P-1,D-1,D-12,T-4,M-1,C-1}
 POLICIES=${POLICIES:-drop,zero}
 ROOT=$(cd "$(dirname "$0")" && pwd)
 cd "$ROOT"
 
+# ---- 自动探测可用 GPU 数量（尊重 CUDA_VISIBLE_DEVICES） ----
+if [ -z "${NGPU:-}" ] || [ "${NGPU}" = "0" ]; then
+  NGPU=$(python -c 'import torch;print(max(1,torch.cuda.device_count()))' 2>/dev/null || echo 1)
+fi
+# 默认每卡 2 进程（超订）：模型小、launch-bound，1 进程/卡只能跑出 ~28% GPU 利用率
+WORKERS=${WORKERS:-$((NGPU * 2))}
+# 多卡自检用 6 个通道（保证 >=5 张卡时每张卡都有活干）
+SMOKE_CHANS=${SMOKE_CHANS:-E-1,P-1,D-1,T-4,C-1,M-1}
+SMOKE_N=$(echo "$SMOKE_CHANS" | tr ',' '\n' | grep -c .)
+
 echo "代码目录 : $ROOT"
 echo "数据目录 : $DATA"
+echo "GPU 数量 : $NGPU (自动探测)"
 echo "GPU      :"
-nvidia-smi --query-gpu=index,name,memory.total,memory.used --format=csv,noheader 2>/dev/null || echo "  未检测到 nvidia-smi"
+nvidia-smi --query-gpu=index,name,memory.total,memory.used --format=csv,noheader 2>/dev/null \
+  | sed 's/^/  GPU /' || echo "  未检测到 nvidia-smi"
 echo
 
 # ---------------------------------------------------------------
@@ -69,15 +80,15 @@ echo "单卡路径通过 ✔"
 echo
 
 # ---------------------------------------------------------------
-echo "==== [2/7] 多卡并行自检 —— 探针路径（${NGPU} 卡各 1 通道） ===="
-python ddtad_parallel.py --prog ddtad_probe.py --ngpu "$NGPU" --workers "$NGPU" \
-  --data_dir "$DATA" --out_dir smoke_par_probe --channels E-1,P-1,D-1,T-4 \
+echo "==== [2/7] 多卡并行自检 —— 探针路径（$NGPU 卡 / $SMOKE_N 个通道） ===="
+python ddtad_parallel.py --prog ddtad_probe.py --ngpu "$NGPU" --workers "$WORKERS" \
+  --data_dir "$DATA" --out_dir smoke_par_probe --channels "$SMOKE_CHANS" \
   --extra "--iters_list 50 --col_policies drop --t_starts 100 --scores paper --n_sample 1 --test_ss 128" \
   2>&1 | tee smoke_par_probe_launch.log
 NGPU_USED=$(grep -c -- '-> GPU' smoke_par_probe_launch.log || true)
 NCH=$(grep -c '^### ' smoke_par_probe/probe_report_all.txt 2>/dev/null || true)
-echo "  实际用到 $NGPU_USED 个进程/GPU，报告里含 $NCH 个通道"
-if [ -f smoke_par_probe/probe_report_all.txt ] && [ "$NCH" -eq 4 ]; then
+echo "  共启动 $NGPU_USED 个分片进程（每张卡应 >=1 个），报告里含 $NCH 个通道（期望 $SMOKE_N）"
+if [ -f smoke_par_probe/probe_report_all.txt ] && [ "$NCH" -eq "$SMOKE_N" ]; then
   echo "多卡探针路径 + 报告合并通过 ✔"
 else
   echo "多卡探针路径失败 ✘ 请查看 smoke_par_probe/shard*.log"; exit 1
@@ -86,13 +97,13 @@ echo
 
 # ---------------------------------------------------------------
 echo "==== [3/7] 多卡并行自检 —— 主程序路径 + 全局汇总合并 ===="
-python ddtad_parallel.py --prog ddtad_run.py --ngpu "$NGPU" --workers "$NGPU" \
-  --data_dir "$DATA" --out_dir smoke_par_run --channels E-1,P-1,D-1,T-4 \
+python ddtad_parallel.py --prog ddtad_run.py --ngpu "$NGPU" --workers "$WORKERS" \
+  --data_dir "$DATA" --out_dir smoke_par_run --channels "$SMOKE_CHANS" \
   --extra "--iters 50 --col_policy drop --t_start 100 --score paper --thresh val --n_sample 1 --test_ss 128" \
   2>&1 | tee smoke_par_run_launch.log
 NROW=$(wc -l < smoke_par_run/summary.csv 2>/dev/null || echo 0)
-echo "  summary.csv 行数 = $NROW （期望 5 = 表头 + 4 个通道）"
-if [ -f smoke_par_run/report.txt ] && [ "$NROW" -eq 5 ]; then
+echo "  summary.csv 行数 = $NROW （期望 $((SMOKE_N+1)) = 表头 + $SMOKE_N 个通道）"
+if [ -f smoke_par_run/report.txt ] && [ "$NROW" -eq "$((SMOKE_N+1))" ]; then
   echo "多卡主程序路径 + write_summary 合并通过 ✔"
   echo "--- smoke_par_run/report.txt 摘要 ---"
   sed -n '1,10p' smoke_par_run/report.txt
@@ -107,12 +118,17 @@ python ddtad_check_data.py --data_dir "$DATA" --out_dir check_out
 echo
 
 # ---------------------------------------------------------------
-echo "==== [5/7] 正式诊断探针：${NGPU} 卡并行，通道=${CHANS}，恒列策略=${POLICIES} ===="
+echo "==== [5/7] 正式诊断探针：$NGPU 卡并行，通道=${CHANS}，恒列策略=${POLICIES} ===="
 echo "  说明: drop = 删掉训练/测试都恒定的列（新默认）；zero = 上一轮的配置（对照组）"
-python ddtad_parallel.py --prog ddtad_probe.py --ngpu "$NGPU" --workers "$NGPU" \
+mkdir -p probe_out
+set +e
+python ddtad_parallel.py --prog ddtad_probe.py --ngpu "$NGPU" --workers "$WORKERS" \
   --data_dir "$DATA" --out_dir probe_out --channels "$CHANS" \
   --extra "--iters_list 6000 --col_policies $POLICIES --t_starts 50,100,200,300,400 --scores paper,zval_max,zself_max --n_sample 2" \
   2>&1 | tee probe_out_launch.log
+RC=${PIPESTATUS[0]}
+set -e
+[ "$RC" -eq 0 ] || echo "⚠ 探针启动器退出码=$RC，请检查 probe_out_launch.log"
 
 # ---------------------------------------------------------------
 echo "==== [6/7] 打包 ===="

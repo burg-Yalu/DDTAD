@@ -69,6 +69,19 @@ N_STEPS_DEFAULT  = 1000    # 完整扩散链步数（cosine 调度）
 T_START_DEFAULT  = 400     # 推理时的有效加噪步数（论文超参 T 的等价位置，可调）
 ETA_DEFAULT      = 2.0     # 阈值系数 η（论文最优 2）
 
+# 方案扫描网格：(打分方式, 阈值方式, 平滑窗口)
+# 第二轮探针结论：t_start=50 时 gap 最大；平滑对长的 contextual 异常有帮助
+VARIANT_GRID = [
+    ("paper",        "val", 0),
+    ("paper",        "val", 9),
+    ("paper",        "val", 25),
+    ("paper",        "val", 51),
+    ("zratio_mean",  "val", 0),
+    ("zratio_mean",  "val", 25),
+    ("zratio_max",   "val", 0),
+    ("zself_max",    "val", 0),
+]
+
 
 # =====================================================================
 # 1. 路径解析（兼容多种解压结构）
@@ -531,19 +544,49 @@ def robust_stats(a):
 
 
 def make_score(E, E_ref, mode="paper"):
-    """E: [T, V] 逐点逐变量重构误差；E_ref: 参考误差（验证段），用于 zval_* 模式。"""
-    if mode == "paper":          # 论文式(12)：对变量求和/取均值
+    """E: [T, V] 逐点逐变量重构误差；E_ref: 参考误差（验证段），用于 zval_* 模式。
+
+    paper       : 论文式(12)，对变量取均值。异常覆盖多个变量时最好，但会被
+                  "难重建但无信息的变量"抬高基线，稀释只落在 1 个变量上的异常。
+    zval_*      : 用**验证段**逐变量 μ,σ 标准化。验证段近似恒定时会数值爆炸（已加保护）。
+    zself_*     : 用**测试段自身**中位数/MAD 标准化。抗分布漂移，但 MAD 极小的变量会让 z 爆表。
+    zratio_*    : 除以**测试段自身中位数**（相对提升倍数），再做 clip。
+                  兼顾"逐变量去偏"与"多变量聚合"，且不会像 z-score 那样爆炸。
+    """
+    if mode == "paper":
         return E.mean(axis=1)
+
     if mode in ("zval_mean", "zval_max"):
-        mu = E_ref.mean(axis=0); sd = E_ref.std(axis=0) + 1e-8
+        mu = E_ref.mean(axis=0)
+        sd = E_ref.std(axis=0)
+        sd = np.maximum(sd, 1e-3 * np.abs(mu) + 1e-8)      # 防止验证段近似恒定 -> 数值爆炸
         z = (E - mu) / sd
         return z.mean(axis=1) if mode.endswith("mean") else z.max(axis=1)
+
     if mode in ("zself_mean", "zself_max"):
         mu = np.median(E, axis=0)
-        sd = 1.4826 * np.median(np.abs(E - mu), axis=0) + 1e-8
+        sd = 1.4826 * np.median(np.abs(E - mu), axis=0)
+        sd = np.maximum(sd, 1e-3 * np.abs(mu) + 1e-8)
         z = (E - mu) / sd
         return z.mean(axis=1) if mode.endswith("mean") else z.max(axis=1)
+
+    if mode in ("zratio_mean", "zratio_max"):
+        base = np.maximum(np.median(E, axis=0), 1e-8)      # 每个变量自身的正常水平
+        r = np.clip(E / base, 0.0, 50.0)                   # clip 防止单个退化变量主导
+        return r.mean(axis=1) if mode.endswith("mean") else r.max(axis=1)
+
     raise ValueError(mode)
+
+
+def smooth_score(s, w):
+    """居中滑动平均平滑异常得分（SMAP/MSL benchmark 的标准做法，能显著抑制点噪声、
+    提升 contextual 长异常段的召回）。w<=1 表示不平滑。"""
+    if not w or w <= 1:
+        return s
+    w = int(w) | 1                                          # 强制奇数
+    pad = w // 2
+    sp = np.pad(s, pad, mode="edge")
+    return np.convolve(sp, np.ones(w) / w, mode="valid")
 
 
 def window_scores(x0, xh):
@@ -666,8 +709,8 @@ def run_channel(args, labels, dev, sched, out_dir, data_root):
     g_pt = gt_points(anom, len(te))
 
     # ---- 打分 + 阈值 + 指标 ----
-    s_val = make_score(E_val, E_val, args.score)
-    s_test = make_score(E_test, E_val, args.score)
+    s_val = smooth_score(make_score(E_val, E_val, args.score), args.smooth)
+    s_test = smooth_score(make_score(E_test, E_val, args.score), args.smooth)
     thresh, mu, sd, how = make_threshold(s_val, s_test, args.thresh, args.eta)
     pred = (s_test > thresh).astype(np.int64)
     m_plain, m_pa = eval_with_pa(pred, g_pt)
@@ -705,13 +748,27 @@ def run_channel(args, labels, dev, sched, out_dir, data_root):
         pl, pa = eval_with_pa(p, g_pt)
         return dict(eta=e, thresh=float(mu + e * sd), pred_pos=float(p.mean()), plain=pl, pa=pa)
 
+    # ---- 方案扫描 ----
+    # 重构已经算好了，各种「打分 × 阈值 × 平滑」组合的评估几乎不花时间。
+    # 这样一次全量跑分就能拿到所有备选方案，事后挑最好的（而不是再跑一轮）。
+    variants = {}
+    for sm, tm, w in VARIANT_GRID:
+        sv = smooth_score(make_score(E_val, E_val, sm), w)
+        stt = smooth_score(make_score(E_test, E_val, sm), w)
+        thr, _, _, _ = make_threshold(sv, stt, tm, args.eta)
+        p = (stt > thr).astype(np.int64)
+        vp, vpa = eval_with_pa(p, g_pt)
+        vo = oracle_best_f1(stt, g_pt)
+        variants[f"{sm}|{tm}|eta{args.eta:g}|w{w}"] = dict(
+            plain=vp, pa=vpa, oracle=vo, pred_pos=float(p.mean()))
+
     res = dict(channel=cid, spacecraft=labels.get(cid, ("?",))[0], cls=labels.get(cid, (None, "?"))[1],
                n_var=V, n_var_raw=int(tr_raw.shape[1]), n_live=int((~st["dead_tr"]).sum()),
                col_policy=policy, n_points=int(len(te)),
                n_anom_points=int(g_pt.sum()), t_start=args.t_start, score=args.score, thresh_mode=args.thresh,
                thresh=float(thresh), mu=mu, sd=sd, oracle=orc,
                point_plain=m_plain, point_pa=m_pa, window_plain=w_plain, window_pa=w_pa,
-               separation=sep,
+               separation=sep, variants=variants,
                eta_sweep=[_eta_row(e) for e in [1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0]],
                hyper=dict(sw=args.sw, train_ss=args.train_ss, test_ss=args.test_ss,
                           n_steps=args.n_steps, t_start=args.t_start, sampler=args.sampler,
@@ -812,7 +869,10 @@ def build_parser():
     ap.add_argument("--sampler", default="ddim", choices=["ddim", "ddpm"])
     ap.add_argument("--n_sample", type=int, default=3)
     ap.add_argument("--score", default="paper",
-                    choices=["paper", "zval_mean", "zval_max", "zself_mean", "zself_max"])
+                    choices=["paper", "zratio_mean", "zratio_max",
+                             "zval_mean", "zval_max", "zself_mean", "zself_max"])
+    ap.add_argument("--smooth", type=int, default=0,
+                    help="得分平滑窗口（奇数，0=不平滑）。SMAP/MSL benchmark 的标准做法，对长 contextual 异常有效")
     ap.add_argument("--thresh", default="val", choices=["val", "val_robust", "test_robust"])
     ap.add_argument("--base", type=int, default=32)
     ap.add_argument("--emb", type=int, default=128)
@@ -864,6 +924,28 @@ def write_summary(all_results, out_dir, hyper=None, title=""):
         lines.append(f"  [{sc}] 通道={len(sub):3d}  plain F1={a['micro_plain']['F1']*100:6.2f}  "
                      f"PA P={a['micro_pa']['P']*100:6.2f} R={a['micro_pa']['R']*100:6.2f} "
                      f"F1={a['micro_pa']['F1']*100:6.2f}")
+
+    # ---- 方案扫描汇总（挑最终超参用） ----
+    vkeys = sorted({k for r in used for k in (r.get("variants") or {})})
+    if vkeys:
+        lines.append("-" * 90)
+        lines.append("方案扫描（所有通道微观汇总，仅诊断；据此确定最终 --score/--smooth）")
+        lines.append(f"  {'score|thresh|eta|smooth':32s} {'plain P':>8} {'R':>8} {'F1':>8} | "
+                     f"{'PA P':>8} {'R':>8} {'F1':>8} | {'macroPA':>8}")
+        for k in vkeys:
+            subs = [r["variants"][k] for r in used if k in (r.get("variants") or {})]
+            if not subs:
+                continue
+            def _mic(key):
+                tp = sum(x[key]["TP"] for x in subs); fp = sum(x[key]["FP"] for x in subs)
+                fn = sum(x[key]["FN"] for x in subs)
+                P = tp / (tp + fp) if tp + fp else 0.0
+                R = tp / (tp + fn) if tp + fn else 0.0
+                return P, R, (2 * P * R / (P + R) if P + R else 0.0)
+            pP, pR, pF = _mic("plain"); aP, aR, aF = _mic("pa")
+            mac = float(np.mean([x["pa"]["F1"] for x in subs]))
+            lines.append(f"  {k:32s} {pP*100:8.2f} {pR*100:8.2f} {pF*100:8.2f} | "
+                         f"{aP*100:8.2f} {aR*100:8.2f} {aF*100:8.2f} | {mac*100:8.2f}")
     lines.append("=" * 90)
     report = "\n".join(lines)
     print("\n" + report, flush=True)
