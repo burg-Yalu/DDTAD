@@ -168,10 +168,19 @@ def main():
     print(flush=True)
 
     fail = []
-    # 进度标记：每完成一个通道，子程序会打印这一串
-    done_token = "✔全部完成" if args.prog.endswith("ddtad_probe.py") else "分离度:"
+    # 进度标记：子程序在每个通道"开始"和"结束"时分别打印这些串。
+    # ★ 注意：token 必须与 ddtad_run.py / ddtad_probe.py 里的实际打印文本**逐字一致**，
+    #   否则会永远统计到 0。曾把 token 写成 "分离度:"，而实际日志是 "分离度(窗口级):"
+    #   —— 跑起来看着像卡死，其实一直在正常推进。
+    if args.prog.endswith("ddtad_probe.py"):
+        start_token, done_token = "★开始训练★", "✔全部完成"
+    else:
+        # 必须用**每个通道只出现一次**的唯一串。
+        # 早先用 "论文口径" 会被末尾协议表里的 "论文口径-窗口级-..." 污染。
+        start_token, done_token = "归一化=", "★论文口径(窗口级/固定阈值/不PA)"
     todo = {i: len(s) for (i, gpu, p, log, shard_dir, s) in procs}
     last_report = 0.0
+    stall_warned = False
 
     while procs:
         time.sleep(10)
@@ -188,20 +197,29 @@ def main():
                     fail.append(i)
         procs = still
 
-        # 每 60s 打一次进度：各分片已完成 / 总数，方便判断是否卡住
+        # 每 60s 打一次进度：各分片「已完成/总数」，另报"进行中"数量
         if procs and time.time() - last_report >= 60:
             last_report = time.time()
-            parts = []
-            tot_done = 0
+            parts, tot_done, tot_started = [], 0, 0
             for i, n in sorted(todo.items()):
-                d = _count_in(os.path.join(args.out_dir, f"shard{i}.log"), done_token)
-                d = min(d, n)
+                logp = os.path.join(args.out_dir, f"shard{i}.log")
+                d = min(_count_in(logp, done_token), n)
+                st = min(_count_in(logp, start_token), n)
                 tot_done += d
+                tot_started += st
                 parts.append(f"s{i}:{d}/{n}")
             el = time.time() - t0
-            eta = (el / tot_done * (sum(todo.values()) - tot_done)) if tot_done else float("nan")
-            print(f"[进度] {el:5.0f}s  已完成 {tot_done}/{sum(todo.values())}   "
-                  f"{'  '.join(parts)}   ETA≈{eta/60:.1f}min", flush=True)
+            if tot_done:
+                eta_txt = f"ETA≈{el / tot_done * (sum(todo.values()) - tot_done) / 60:.1f}min"
+            else:
+                eta_txt = "ETA=未知(尚无完成)"
+            print(f"[进度] {el:5.0f}s  完成 {tot_done}/{sum(todo.values())}  "
+                  f"进行中 {max(tot_started - tot_done, 0)}   {'  '.join(parts)}   {eta_txt}", flush=True)
+            # 15 分钟还没有任何通道完成 -> 提示去看日志，避免误以为卡死
+            if not stall_warned and tot_done == 0 and el > 900:
+                stall_warned = True
+                print(f"        （15 分钟尚无通道完成；若「进行中」>0 说明在正常训练，"
+                      f"可 tail -f {args.out_dir}/shard0.log 观察）", flush=True)
 
     # ---------------- 合并 ----------------
     print("\n" + "=" * 90)
